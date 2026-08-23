@@ -7,7 +7,8 @@ from fmmax.eig import (
 
 
 class ProcessedDriftMatrix(NamedTuple):
-    """Stores eigendecompositions of A, (A+A^T)/2"""
+    """Stores eigendecompositions of A, (A+A^T)/2, the noise covariance in the
+    eigenbasis of A (noise_cov_eigbasis) and whether A is normal (is_normal)."""
 
     val: Array
     eigvals: Array
@@ -15,6 +16,8 @@ class ProcessedDriftMatrix(NamedTuple):
     eigvecs_inv: Array
     sym_eigvals: Array
     sym_eigvecs: Array
+    noise_cov_eigbasis: Array
+    is_normal: Array
 
 
 def preprocess_drift_matrix(A: Array) -> ProcessedDriftMatrix:
@@ -33,6 +36,13 @@ def preprocess_drift_matrix(A: Array) -> ProcessedDriftMatrix:
     symA = 0.5 * (A + A.T)
     symA_eigvals, symA_eigvecs = jnp.linalg.eigh(symA)
 
+    noise_cov_eigbasis = A_eigvecs_inv @ A_eigvecs_inv.conj().T
+
+    # A is normal iff A A^T = A^T A; tolerance scales with the working precision.
+    tol = 1e3 * jnp.finfo(A_eigvecs.real.dtype).eps
+    commutator_norm = jnp.linalg.norm(A @ A.T - A.T @ A)
+    is_normal = commutator_norm <= tol * jnp.linalg.norm(A) ** 2
+
     return ProcessedDriftMatrix(
         A,
         A_eigvals,
@@ -40,6 +50,8 @@ def preprocess_drift_matrix(A: Array) -> ProcessedDriftMatrix:
         A_eigvecs_inv,
         symA_eigvals,
         symA_eigvecs,
+        noise_cov_eigbasis,
+        is_normal,
     )
 
 

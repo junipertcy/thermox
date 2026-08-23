@@ -27,7 +27,7 @@ def sample(
     by using exact diagonalization.
 
     Preprocessing (diagonalization) costs O(d^3) and sampling costs O(T * d^2),
-    where T=len(ts).
+    where T=len(ts), or O(T * d^3) when D^-0.5 @ A @ D^0.5 is not a normal matrix.
 
     If associative_scan=True then jax.lax.associative_scan is used which will run in
     time O((T/p + log(T)) * d^2) on a GPU/TPU with p cores, still with
@@ -82,11 +82,52 @@ def expm_vp(A, v, dt):
     return out.real
 
 
+def transition_cov(A, dt):
+    """Covariance of x_dt given x_0 for dx = -A x dt + dW, i.e.
+    int_0^dt exp(-A s) exp(-A^T s) ds, computed in the eigenbasis of A.
+    Exact for any stable, diagonalizable A.
+    """
+    eigvals_sum = A.eigvals[:, None] + A.eigvals.conj()[None, :]
+    integral = -jnp.expm1(-eigvals_sum * dt) / eigvals_sum
+    cov = A.eigvecs @ (A.noise_cov_eigbasis * integral) @ A.eigvecs.conj().T
+    cov = cov.real
+    return 0.5 * (cov + cov.T)
+
+
+def transition_cov_eigh(A, dt, apply=lambda w, U: (w, U)):
+    """Spectral factorization transition_cov(A, dt) = U diag(w) U^T, returned as
+    apply(w, U).
+
+    Branches on A.is_normal. Normal A: U = A.sym_eigvecs is precomputed and w is
+    a closed-form function of dt, O(d^2) per step. Otherwise transition_cov(A, dt)
+    is eigendecomposed at each step, O(d^3). apply is evaluated inside the branch
+    so that only its result, not a d x d matrix per step, leaves the lax.cond.
+
+    Gradients with respect to A follow the branch taken: at an exactly normal A
+    they are those of the normal-branch formula, which depends on A only through
+    (A + A^T)/2.
+    """
+
+    def normal(A, dt):
+        w = (1 - jnp.exp(-2 * A.sym_eigvals * dt)) / (2 * A.sym_eigvals)
+        return apply(w, A.sym_eigvecs)
+
+    def general(A, dt):
+        # eigh rather than Cholesky: stays well defined at dt = 0 (zero covariance).
+        w, U = jnp.linalg.eigh(transition_cov(A, dt))
+        return apply(w, U)
+
+    # apply is evaluated inside the branches so the cond returns a small result;
+    # returning (w, U) and applying it outside made the associative-scan path
+    # measurably slower (vmap's cond batching rule broadcasts the d x d U over all
+    # steps).
+    return jax.lax.cond(A.is_normal, normal, general, A, dt)
+
+
 def transition_cov_sqrt_vp(A, v, dt):
-    diag = ((1 - jnp.exp(-2 * A.sym_eigvals * dt)) / (2 * A.sym_eigvals)) ** 0.5
-    out = diag * v
-    out = A.sym_eigvecs @ out
-    return out.real
+    return transition_cov_eigh(
+        A, dt, lambda w, U: U @ (jnp.sqrt(jnp.maximum(w, 0.0)) * v)
+    )
 
 
 def _sample_identity_diffusion_scan(

@@ -8,7 +8,7 @@ from thermox.utils import (
     ProcessedDriftMatrix,
     ProcessedDiffusionMatrix,
 )
-from thermox.sampler import expm_vp
+from thermox.sampler import expm_vp, transition_cov_eigh
 
 
 def log_prob(
@@ -28,7 +28,7 @@ def log_prob(
     Assumes x(t_0) is given deterministically.
 
     Preprocessing (diagonalisation) costs O(d^3) and evaluation then costs O(T * d^2),
-    where T=len(ts).
+    where T=len(ts), or O(T * d^3) when D^-0.5 @ A @ D^0.5 is not a normal matrix.
 
     By default, this function does the preprocessing on A and D before the evaluation.
     However, the preprocessing can be done externally using thermox.preprocess
@@ -57,20 +57,6 @@ def log_prob(
     return log_prob_ys + D_sqrt_inv_log_det * (len(ts) - 1)
 
 
-def transition_cov_sqrt_inv_vp(A, v, dt):
-    diag = ((1 - jnp.exp(-2 * A.sym_eigvals * dt)) / (2 * A.sym_eigvals)) ** 0.5
-    diag = jnp.where(diag < 1e-20, 1e-20, diag)
-    out = A.sym_eigvecs.T @ v
-    out = out / diag
-    return out.real
-
-
-def transition_cov_log_det(A, dt):
-    diag = (1 - jnp.exp(-2 * A.sym_eigvals * dt)) / (2 * A.sym_eigvals)
-    diag = jnp.where(diag < 1e-20, 1e-20, diag)
-    return jnp.sum(jnp.log(diag))
-
-
 def log_prob_identity_diffusion(
     ts: Array,
     xs: Array,
@@ -84,13 +70,16 @@ def log_prob_identity_diffusion(
         return b + expm_vp(A, y - b, dt)
 
     def logpt(yt, y0, dt):
-        mean = transition_mean(y0, dt)
-        diff_val = transition_cov_sqrt_inv_vp(A, yt - mean, dt)
-        return (
-            -jnp.dot(diff_val, diff_val) / 2
-            - transition_cov_log_det(A, dt) / 2
-            - jnp.log(2 * jnp.pi) * (yt.shape[0] / 2)
-        )
+        diff = yt - transition_mean(y0, dt)
+
+        def mahalanobis_and_log_det(w, U):
+            w = jnp.where(w < 1e-20, 1e-20, w)
+            diff_val = (U.T @ diff) / jnp.sqrt(w)
+            return jnp.dot(diff_val, diff_val), jnp.sum(jnp.log(w))
+
+        # One factorization of the transition covariance per step serves both terms.
+        quad, log_det = transition_cov_eigh(A, dt, mahalanobis_and_log_det)
+        return -quad / 2 - log_det / 2 - jnp.log(2 * jnp.pi) * (yt.shape[0] / 2)
 
     log_prob_val = fori_loop(
         1,

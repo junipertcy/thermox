@@ -1,5 +1,5 @@
 import jax.numpy as jnp
-from jax.lax import fori_loop
+from jax.lax import cond, fori_loop
 from jax import Array, vmap
 
 from thermox.utils import (
@@ -8,7 +8,12 @@ from thermox.utils import (
     ProcessedDriftMatrix,
     ProcessedDiffusionMatrix,
 )
-from thermox.sampler import expm_vp, transition_cov_eigh
+from thermox.sampler import (
+    expm_vp,
+    transition_cov_eigh,
+    transition_expm_and_cov,
+    uniform_dt,
+)
 
 
 def log_prob(
@@ -28,7 +33,8 @@ def log_prob(
     Assumes x(t_0) is given deterministically.
 
     Preprocessing (diagonalisation) costs O(d^3) and evaluation then costs O(T * d^2),
-    where T=len(ts), or O(T * d^3) when D^-0.5 @ A @ D^0.5 is not a normal matrix.
+    where T=len(ts); when D^-0.5 @ A @ D^0.5 is not a normal matrix,
+    O(d^3 log T + T * d^2) on a uniform time grid and O(T * d^3) otherwise.
 
     By default, this function does the preprocessing on A and D before the evaluation.
     However, the preprocessing can be done externally using thermox.preprocess
@@ -65,7 +71,22 @@ def log_prob_identity_diffusion(
 ) -> float:
     if isinstance(A, Array):
         A = preprocess_drift_matrix(A)
+    if len(ts) < 3:
+        return _log_prob_identity_diffusion_stepwise(ts, xs, A, b)
+    # A non-normal A on a uniform grid: build the transition operator once.
+    is_uniform, dt = uniform_dt(ts)
+    return cond(
+        is_uniform & ~A.is_normal,
+        lambda ts, xs, A, b: _log_prob_identity_diffusion_uniform(ts, xs, A, b, dt),
+        _log_prob_identity_diffusion_stepwise,
+        ts,
+        xs,
+        A,
+        b,
+    )
 
+
+def _log_prob_identity_diffusion_stepwise(ts, xs, A, b):
     def transition_mean(y, dt):
         return b + expm_vp(A, y - b, dt)
 
@@ -89,3 +110,25 @@ def log_prob_identity_diffusion(
     )
 
     return log_prob_val.real
+
+
+def _log_prob_identity_diffusion_uniform(ts, xs, A, b, dt):
+    """log_prob_identity_diffusion on a uniform grid: the residuals of all
+    steps with gap dt at once, one eigendecomposition of their common
+    covariance, and one term for the first gap."""
+    E1, cov1 = transition_expm_and_cov(A.val, ts[1] - ts[0])
+    E, cov = transition_expm_and_cov(A.val, dt)
+    residuals1 = xs[1] - b - E1 @ (xs[0] - b)
+    residuals = xs[2:] - b - (xs[1:-1] - b) @ E.T
+
+    def log_density(cov, r):
+        w, U = jnp.linalg.eigh(cov)
+        w = jnp.where(w < 1e-20, 1e-20, w)
+        z = (r @ U) / jnp.sqrt(w)
+        n, d = r.shape
+        return (
+            -jnp.sum(z * z) / 2
+            - n * (jnp.sum(jnp.log(w)) + d * jnp.log(2 * jnp.pi)) / 2
+        )
+
+    return log_density(cov1, residuals1[None]) + log_density(cov, residuals)

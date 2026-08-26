@@ -8,6 +8,7 @@ import jax.numpy as jnp
 import pytest
 
 import thermox
+from thermox.sampler import _scan_linear_recurrence, uniform_dt
 from thermox.utils import preprocess_drift_matrix
 
 jax.config.update("jax_enable_x64", True)
@@ -98,21 +99,29 @@ def reference_log_prob(ts, xs, A, b, D):
     )
 
 
+GRIDS = [
+    pytest.param(
+        jnp.array([0.0, 0.1, 0.5, 0.6, 1.4]), id="non-uniform"
+    ),  # per-step path
+    pytest.param(jnp.arange(0.0, 1.5, 0.1), id="uniform"),  # factor-once path
+]
+
+
+@pytest.mark.parametrize("ts", GRIDS)
 @pytest.mark.parametrize("A,D", NONNORMAL_CASES)
-def test_log_prob_matches_reference_gaussian(A, D):
+def test_log_prob_matches_reference_gaussian(A, D, ts):
     d = A.shape[0]
     b = jnp.arange(1.0, d + 1.0)
-    ts = jnp.array([0.0, 0.1, 0.5, 0.6, 1.4])
     xs = jax.random.normal(jax.random.PRNGKey(3), (len(ts), d))
     ref = reference_log_prob(ts, xs, A, b, D)
     assert jnp.isclose(thermox.log_prob(ts, xs, A, b, D), ref, rtol=1e-8)
 
 
+@pytest.mark.parametrize("ts", GRIDS)
 @pytest.mark.parametrize("A,D", NONNORMAL_CASES)
-def test_log_prob_grad_wrt_drift_matches_reference(A, D):
+def test_log_prob_grad_wrt_drift_matches_reference(A, D, ts):
     d = A.shape[0]
     b = jnp.arange(1.0, d + 1.0)
-    ts = jnp.array([0.0, 0.1, 0.5, 0.6, 1.4])
     xs = jax.random.normal(jax.random.PRNGKey(3), (len(ts), d))
     g = jax.grad(lambda A: thermox.log_prob(ts, xs, A, b, D))(A)
     g_ref = jax.grad(lambda A: reference_log_prob(ts, xs, A, b, D))(A)
@@ -134,9 +143,11 @@ def test_log_prob_grad_symmetric_parametrization_matches_reference():
     assert relerr(g, g_ref) < 1e-8
 
 
-def test_sample_covariance_matches_lyapunov_for_anisotropic_noise():
+@pytest.mark.parametrize("jitter", [0.0, 0.5], ids=["uniform-grid", "jittered-grid"])
+def test_sample_covariance_matches_lyapunov_for_anisotropic_noise(jitter):
     A, D = A_SYM, D_DIAG
     ts = jnp.arange(0.0, 20000.0, 0.5)
+    ts = jnp.sort(ts + jitter * jax.random.uniform(jax.random.PRNGKey(1), ts.shape))
     xs = thermox.sample(jax.random.PRNGKey(0), ts, jnp.zeros(3), A, jnp.zeros(3), D)
     emp = jnp.cov(xs[2000:].T)
     # Monte Carlo error of the sample covariance is ~1e-2 here; the symmetric-part
@@ -189,3 +200,103 @@ def test_preprocess_flags_normality():
     # symmetric A becomes non-normal after transforming with anisotropic D
     A_y, _ = thermox.preprocess(A_SYM, D_DIAG)
     assert not bool(A_y.is_normal)
+
+
+def ill_conditioned_eigenvectors_case():
+    # d = 12, diag(1..3) plus 6 x a strictly upper triangular Gaussian: eigenvector
+    # condition number ~1e9, where a formula in the eigenbasis of A loses everything.
+    d = 12
+    upper = jnp.triu(jax.random.normal(jax.random.PRNGKey(0), (d, d)), 1)
+    return jnp.diag(jnp.linspace(1.0, 3.0, d)) + 6.0 * upper
+
+
+@pytest.mark.parametrize("t", [0.01, 0.3])
+def test_covariance_accurate_for_ill_conditioned_eigenvectors(t):
+    A = ill_conditioned_eigenvectors_case()
+    D = jnp.eye(A.shape[0])
+    assert jnp.linalg.cond(jnp.linalg.eig(A)[1]) > 1e8
+    cov = thermox.conditional.covariance(t, A, D)
+    assert relerr(cov, van_loan_covariance(A, D, t)) < 1e-12
+
+
+def test_covariance_is_zero_at_t_zero():
+    A = ill_conditioned_eigenvectors_case()
+    cov = thermox.conditional.covariance(0.0, A, jnp.eye(A.shape[0]))
+    assert jnp.all(cov == 0.0)
+
+
+def linalg_grid(burnin, num_samples=100, dt=0.1):
+    # The grid thermox.linalg builds: x0 at time 0, one gap of burnin * dt, then dt.
+    ts = jnp.arange(burnin, burnin + num_samples + 1) * dt
+    return jnp.concatenate([jnp.array([0]), ts])
+
+
+@pytest.mark.parametrize(
+    "ts",
+    [
+        pytest.param(jnp.arange(0, 1, 0.01), id="readme-arange"),
+        pytest.param(linalg_grid(0), id="linalg-burnin-0"),
+        pytest.param(linalg_grid(1), id="linalg-burnin-1"),
+        pytest.param(linalg_grid(5), id="linalg-burnin-5"),
+        pytest.param((jnp.arange(0, 10001) * 0.1).astype(jnp.float32), id="float32"),
+        pytest.param(jnp.linspace(0, 100, 300), id="linspace"),
+    ],
+)
+def test_uniform_dt_accepts_grids_uniform_up_to_rounding(ts):
+    is_uniform, dt = uniform_dt(ts)
+    assert bool(is_uniform)
+    assert jnp.isclose(dt, ts[2] - ts[1], rtol=1e-6)
+
+
+def test_uniform_dt_rejects_jittered_grid():
+    ts = jnp.arange(0, 100, 0.1)
+    ts = jnp.sort(ts + jax.random.uniform(jax.random.PRNGKey(0), ts.shape) * 0.1)
+    assert not bool(uniform_dt(ts)[0])
+
+
+def contracting_matrix(key, d=4):
+    return jax.scipy.linalg.expm(
+        -(jax.random.normal(key, (d, d)) / d**0.5 + 3 * jnp.eye(d))
+    )
+
+
+@pytest.mark.parametrize("n", [1, 2, 3, 4, 5, 1000, 1001])
+def test_scan_linear_recurrence_matches_sequential_scan(n):
+    k1, k2, k3 = jax.random.split(jax.random.PRNGKey(n), 3)
+    E = contracting_matrix(k1)
+    y0 = jax.random.normal(k2, (4,))
+    u = jax.random.normal(k3, (n, 4))
+    _, ys = jax.lax.scan(lambda y, u_k: (E @ y + u_k,) * 2, y0, u)
+    assert jnp.allclose(_scan_linear_recurrence(E, y0, u), ys, rtol=1e-12, atol=1e-12)
+
+
+def test_uniform_grid_engines_agree_for_ill_conditioned_eigenvectors():
+    # On a uniform grid both engines apply one exp(-A dt); propagated through the
+    # eigenbasis of A (per-step path) they disagree at ~1e-10 for this family.
+    A = ill_conditioned_eigenvectors_case()
+    d = A.shape[0]
+    ts = jnp.arange(0.0, 1.0, 0.05)
+    key = jax.random.PRNGKey(0)
+    x0, b, D = jnp.ones(d), jnp.zeros(d), jnp.eye(d)
+    xa = thermox.sample(key, ts, x0, A, b, D, associative_scan=True)
+    xs = thermox.sample(key, ts, x0, A, b, D, associative_scan=False)
+    assert relerr(xa, xs) < 1e-12
+
+
+def test_log_prob_on_uniform_grid_exact_for_ill_conditioned_eigenvectors():
+    A = ill_conditioned_eigenvectors_case()
+    d = A.shape[0]
+    ts = jnp.arange(0.0, 1.0, 0.05)
+    x0, b, D = jnp.ones(d), jnp.zeros(d), jnp.eye(d)
+    xs = thermox.sample(jax.random.PRNGKey(0), ts, x0, A, b, D)
+    lp = thermox.log_prob(ts, xs, A, b, D)
+    ref = reference_log_prob(ts, xs, A, b, D)
+    assert jnp.abs(lp - ref) / jnp.abs(ref) < 1e-11
+
+
+def test_linalg_expm_of_nonsymmetric_matrix():
+    # expnegm's whitened drift is non-normal for a non-symmetric input: on
+    # upstream main this estimate is off by 0.6; Monte Carlo noise is ~0.01.
+    M = jnp.array([[-1.0, 3.0], [0.0, -2.0]])
+    est = thermox.linalg.expm(M, num_samples=100000, dt=0.1, burnin=0, alpha=1.0)
+    assert jnp.allclose(est, jax.scipy.linalg.expm(M), atol=1e-1)

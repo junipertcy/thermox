@@ -28,7 +28,7 @@ def sample(
 
     Preprocessing (diagonalization) costs O(d^3) and sampling costs O(T * d^2),
     where T=len(ts); when D^-0.5 @ A @ D^0.5 is not a normal matrix,
-    O(d^3 log T + T * d^2) on a uniform time grid and O(T * d^3) otherwise.
+    O(d^3 + T * d^2) on any time grid.
 
     If associative_scan=True then jax.lax.associative_scan is used which will run in
     time O((T/p + log(T)) * d^2) on a GPU/TPU with p cores, still with
@@ -78,12 +78,19 @@ def sample_identity_diffusion(
         stepwise = _sample_identity_diffusion_scan
     if len(ts) < 3:
         return stepwise(key, ts, x0, A, b)
-    # A non-normal A on a uniform grid: build the transition operator once.
+    # A non-normal A: build the transition operator once on a uniform grid, or one
+    # per binary digit of the gaps (the ladder) on any other grid.
     is_uniform, dt = uniform_dt(ts)
-    return jax.lax.cond(
-        is_uniform & ~A.is_normal,
-        lambda *args: _sample_identity_diffusion_uniform(*args, dt, associative_scan),
-        stepwise,
+    index = jnp.where(A.is_normal, 0, jnp.where(is_uniform, 1, 2)).astype(jnp.int32)
+    return jax.lax.switch(
+        index,
+        [
+            stepwise,
+            lambda *args: _sample_identity_diffusion_uniform(
+                *args, dt, associative_scan
+            ),
+            lambda *args: _sample_identity_diffusion_ladder(*args, associative_scan),
+        ],
         key,
         ts,
         x0,
@@ -221,6 +228,74 @@ def _sample_identity_diffusion_uniform(key, ts, x0, A, b, dt, associative_scan):
     else:
         _, ys = jax.lax.scan(lambda y, u_k: (E @ y + u_k,) * 2, y1, u)
     return jnp.concatenate([x0[None], y1[None] + b, ys + b])
+
+
+def _ladder_lattice(ts):
+    """Gaps of ts as integers on the lattice delta = 2^(e - M), where 2^e is the
+    power of two just above the largest gap and M the number of mantissa bits
+    of ts (52 in float64, 23 in float32): M + 1 binary digits, and every gap is
+    reproduced to the rounding of the time stamps themselves. A power of two
+    keeps dts / delta exact, so the digits do not depend on how it is compiled.
+    """
+    dts = jnp.diff(ts)
+    M = jnp.finfo(ts.dtype).nmant
+    delta = jnp.ldexp(jnp.ones((), ts.dtype), jnp.frexp(jnp.max(dts))[1] - M)
+    n = jnp.round(dts / delta).astype(jnp.int64 if M > 23 else jnp.int32)
+    return delta, n, M
+
+
+def _ladder_noise(A, ts, key):
+    """Noise terms of every step, shape (len(ts) - 1, d), from a dyadic ladder of
+    transition operators: for level j the pair E_j = exp(-A delta 2^j),
+    L_j L_j^T = cov(delta 2^j) is built once and applied to the steps whose gap
+    has bit j set, e <- E_j e + L_j z_j, which composes the covariances exactly
+    (cov(a + b) = cov(b) + E(b) cov(a) E(b)^T). M + 1 operators once, two
+    masked products per level and step.
+    """
+    delta, n, M = _ladder_lattice(ts)
+    d = A.val.shape[0]
+
+    def level(e, j):
+        E, cov = transition_expm_and_cov(A.val, jnp.ldexp(delta, j))
+        # Cholesky, not eigh: every level's gap is positive, and the factor is unique,
+        # so draws at a fixed key do not depend on how the level was compiled.
+        L = jnp.linalg.cholesky(cov)
+        z = jax.random.normal(jax.random.fold_in(key, j), (len(n), d))
+        bit = ((n >> j.astype(n.dtype)) & 1).astype(bool)
+        return jnp.where(bit[:, None], e @ E.T + z @ L.T, e), None
+
+    noise, _ = jax.lax.scan(level, jnp.zeros((len(n), d)), jnp.arange(M + 1))
+    return noise
+
+
+def _sample_identity_diffusion_ladder(key, ts, x0, A, b, associative_scan):
+    # Noise from the ladder, mean through the eigenbasis as on the per-step paths.
+    dts = jnp.diff(ts)
+    noise = _ladder_noise(A, ts, key)
+    if associative_scan:
+
+        @partial(jax.vmap, in_axes=(0, 0))
+        def binary_associative_operator(elem_a, elem_b):
+            t_a, x_a = elem_a
+            t_b, x_b = elem_b
+            return t_a + t_b, expm_vp(A, x_a, t_b) + x_b
+
+        scan_times = jnp.concatenate([ts[:1], dts])
+        scan_values = jnp.concatenate([x0[None] - b, noise])
+        return (
+            jax.lax.associative_scan(
+                binary_associative_operator, (scan_times, scan_values)
+            )[1]
+            + b
+        )
+
+    def step(x, dt_and_u):
+        dt, u = dt_and_u
+        x = b + expm_vp(A, x - b, dt) + u
+        return x, x
+
+    _, xs = jax.lax.scan(step, x0.astype(noise.dtype), (dts, noise))
+    return jnp.concatenate([x0[None], xs])
 
 
 def _sample_identity_diffusion_scan(

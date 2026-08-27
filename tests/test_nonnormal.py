@@ -300,3 +300,171 @@ def test_linalg_expm_of_nonsymmetric_matrix():
     M = jnp.array([[-1.0, 3.0], [0.0, -2.0]])
     est = thermox.linalg.expm(M, num_samples=100000, dt=0.1, burnin=0, alpha=1.0)
     assert jnp.allclose(est, jax.scipy.linalg.expm(M), atol=1e-1)
+
+
+# --- dyadic ladder: non-normal A on a non-uniform grid ---------------------------
+
+
+def jittered_grid(n, dt=0.1, seed=1):
+    ts = jnp.arange(0.0, n * dt, dt)
+    return jnp.sort(
+        ts + 0.5 * dt * jax.random.uniform(jax.random.PRNGKey(seed), ts.shape)
+    )
+
+
+def random_stable_drift(d, seed=2):
+    # i.i.d. Gaussian / sqrt(d) plus 1.1 I: non-normal, all eigenvalues in the right half-plane
+    return jax.random.normal(jax.random.PRNGKey(seed), (d, d)) / d**0.5 + 1.1 * jnp.eye(
+        d
+    )
+
+
+@pytest.mark.parametrize("A,D", NONNORMAL_CASES)
+def test_ladder_covariance_matches_reference(A, D):
+    # The fold run on covariance matrices instead of draws reproduces Sigma(dt_k)
+    # of the grid as given, for every step, from the ladder's own levels.
+    from thermox.sampler import _ladder_lattice, transition_expm_and_cov
+
+    ts = jittered_grid(301)
+    dts = jnp.diff(ts)
+    A_y, PD = thermox.preprocess(A, D)
+    delta, n, M = _ladder_lattice(ts)
+    assert jnp.max(jnp.abs(n * delta - dts)) <= 1e-12 * jnp.max(ts)
+    d = A.shape[0]
+    C = jnp.zeros((len(dts), d, d))
+    for j in range(M + 1):
+        E, cov = transition_expm_and_cov(A_y.val, delta * 2.0**j)
+        bit = ((n >> j) & 1).astype(bool)
+        C = jnp.where(
+            bit[:, None, None], jnp.einsum("ij,tjk,lk->til", E, C, E) + cov, C
+        )
+    C = jnp.einsum("ij,tjk,lk->til", PD.sqrt, C, PD.sqrt)
+    for k in range(len(dts)):
+        assert relerr(C[k], van_loan_covariance(A, D, dts[k])) < 1e-10
+
+
+@pytest.mark.parametrize("path", ["ladder", "per-step"])
+def test_ladder_whitened_draws_are_standard_normal(path):
+    # 20 000 irregular steps whitened with the reference factor of each step's
+    # covariance: covariance I and mean 0 to Monte Carlo accuracy, on both paths.
+    from thermox.sampler import (
+        _sample_identity_diffusion_ladder,
+        _sample_identity_diffusion_scan,
+        expm_vp,
+    )
+
+    d, T = 8, 20_000
+    A, D = random_stable_drift(d), jnp.eye(d)
+    ts = jnp.sort(jax.random.uniform(jax.random.PRNGKey(3), (T + 1,))) * T * 0.5
+    A_y, _ = thermox.preprocess(A, D)
+    b, x0, key = jnp.zeros(d), jnp.zeros(d), jax.random.PRNGKey(0)
+    if path == "ladder":
+        ys = _sample_identity_diffusion_ladder(key, ts, x0, A_y, b, True)
+    else:
+        ys = _sample_identity_diffusion_scan(key, ts, x0, A_y, b)
+    dts = jnp.diff(ts)
+    means = jax.vmap(lambda y, dt: expm_vp(A_y, y, dt))(ys[:-1], dts)
+    covs = jax.vmap(lambda dt: van_loan_covariance(A, D, dt))(dts)
+    Ls = jnp.linalg.cholesky(covs)
+    z = jax.vmap(lambda L, r: jax.scipy.linalg.solve_triangular(L, r, lower=True))(
+        Ls, ys[1:] - means
+    )
+    assert jnp.max(jnp.abs(z.T @ z / T - jnp.eye(d))) < 4 * (2 / T) ** 0.5
+    assert jnp.max(jnp.abs(jnp.mean(z, axis=0))) < 4 * (1 / T) ** 0.5
+
+
+@pytest.mark.parametrize("dtype,tol", [(jnp.float64, 1e-12), (jnp.float32, 1e-5)])
+def test_ladder_engines_agree(dtype, tol):
+    from thermox.sampler import _sample_identity_diffusion_ladder
+
+    A, D = A_TRI.astype(dtype), jnp.eye(3, dtype=dtype)
+    ts = jittered_grid(200).astype(dtype)
+    A_y, _ = thermox.preprocess(A, D)
+    b, x0, key = jnp.ones(3, dtype), jnp.zeros(3, dtype), jax.random.PRNGKey(0)
+    xa = _sample_identity_diffusion_ladder(key, ts, x0, A_y, b, True)
+    xs = _sample_identity_diffusion_ladder(key, ts, x0, A_y, b, False)
+    # Draws take the default float dtype, as in the other engines: float64 here
+    # because the test module enables x64, float32 in thermox's default setting.
+    assert relerr(xa, xs) < tol
+
+
+def test_ladder_vmap_over_keys_matches_single_draws():
+    A, D = A_TRI, jnp.eye(3)
+    ts = jittered_grid(50)
+    b, x0 = jnp.ones(3), jnp.zeros(3)
+    keys = jax.random.split(jax.random.PRNGKey(0), 4)
+    batched = jax.vmap(lambda k: thermox.sample(k, ts, x0, A, b, D))(keys)
+    single = jnp.stack([thermox.sample(k, ts, x0, A, b, D) for k in keys])
+    assert jnp.array_equal(batched, single)
+
+
+def test_ladder_zero_gap_repeats_the_state():
+    from thermox.sampler import _sample_identity_diffusion_ladder
+
+    ts = jittered_grid(50)
+    ts = jnp.concatenate([ts[:20], ts[19:20], ts[20:]])  # repeated time inside the grid
+    A_y, _ = thermox.preprocess(A_TRI, jnp.eye(3))
+    xs = _sample_identity_diffusion_ladder(
+        jax.random.PRNGKey(0), ts, jnp.zeros(3), A_y, jnp.ones(3), True
+    )
+    assert jnp.all(jnp.isfinite(xs))
+    assert jnp.allclose(
+        xs[20], xs[19], rtol=1e-14, atol=1e-14
+    )  # exp(0) x = x to rounding
+
+
+@pytest.mark.parametrize("dtype,levels", [(jnp.float64, 53), (jnp.float32, 24)])
+def test_ladder_operator_count_is_independent_of_T(dtype, levels):
+    # One transition operator per mantissa bit of ts, built inside one scan; no
+    # factorization per step (the structure does not change with T).
+    from thermox.sampler import _ladder_noise
+
+    A_y, _ = thermox.preprocess(A_TRI.astype(dtype), jnp.eye(3, dtype=dtype))
+    texts = []
+    for n in (100, 200):
+        ts = jittered_grid(n).astype(dtype)
+        texts.append(
+            str(
+                jax.make_jaxpr(lambda k: _ladder_noise(A_y, ts, k))(
+                    jax.random.PRNGKey(0)
+                )
+            )
+        )
+    import re
+
+    for text in texts:
+        assert "eigh" not in text
+        assert text.count(f"length={levels}") == 1  # the one scan over the levels
+    # The loop structure (the level scan and expm's own squaring loop) is the same for both T.
+    assert re.findall(r"length=\d+", texts[0]) == re.findall(r"length=\d+", texts[1])
+
+
+def test_sample_dispatches_to_ladder_on_nonuniform_grid():
+    # thermox.sample takes the ladder for non-normal A on a non-uniform grid.
+    from thermox.sampler import _sample_identity_diffusion_ladder
+
+    A, D = A_SYM, D_DIAG
+    ts = jittered_grid(50)
+    b, x0, key = jnp.ones(3), jnp.zeros(3), jax.random.PRNGKey(0)
+    A_y, PD = thermox.preprocess(A, D)
+    ys = _sample_identity_diffusion_ladder(
+        key, ts, PD.sqrt_inv @ x0, A_y, PD.sqrt_inv @ b, True
+    )
+    direct = jax.vmap(jnp.matmul, in_axes=(None, 0))(PD.sqrt, ys)
+    assert jnp.array_equal(thermox.sample(key, ts, x0, A, b, D), direct)
+
+
+@pytest.mark.parametrize("dtype", [jnp.float64, jnp.float32])
+def test_ladder_lattice_is_exact(dtype):
+    # The unit is exactly a power of two; dyadic gaps have exactly their binary digits.
+    from thermox.sampler import _ladder_lattice
+
+    ts = jnp.array([0.0, 0.5, 0.75, 1.5], dtype)
+    delta, n, M = _ladder_lattice(ts)
+    assert delta.dtype == dtype and M == (52 if dtype == jnp.float64 else 23)
+    assert float(delta) == 2.0 ** (0 - M)  # largest gap 0.75 = 0.75 * 2^0
+    assert [int(v) for v in n] == [
+        2 ** (M - 1),
+        2 ** (M - 2),
+        2 ** (M - 1) + 2 ** (M - 2),
+    ]

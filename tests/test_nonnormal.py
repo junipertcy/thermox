@@ -468,3 +468,212 @@ def test_ladder_lattice_is_exact(dtype):
         2 ** (M - 2),
         2 ** (M - 1) + 2 ** (M - 2),
     ]
+
+
+# --- Chebyshev panels: log det Sigma(dt) on a non-uniform grid --------------------
+
+
+def random_gaps_grid(n, decades=3.0, seed=4):
+    # Gaps log-uniform over the given number of decades; every gap is different.
+    gaps = 10 ** jax.random.uniform(
+        jax.random.PRNGKey(seed), (n,), minval=-decades / 2, maxval=decades / 2
+    )
+    return jnp.concatenate([jnp.zeros(1), jnp.cumsum(gaps)]) * 0.1
+
+
+def oscillatory_drift():
+    # Eigenvalues 1 +- 10i and 2: |Im lambda| / Re lambda = 10.
+    return jnp.array([[1.0, 10.0, 0.5], [-10.0, 1.0, 0.0], [0.0, 0.0, 2.0]])
+
+
+def test_chebyshev_matrix_is_exact_on_chebyshev_polynomials():
+    from thermox.prob import _chebyshev_matrix
+
+    N = 8
+    x_nodes = jnp.cos(jnp.pi * jnp.arange(N + 1) / N)
+    for k in range(N + 1):
+        # The transform of T_k sampled at the nodes is the unit vector e_k.
+        coeffs = _chebyshev_matrix(N) @ jnp.cos(k * jnp.arccos(x_nodes))
+        assert jnp.allclose(coeffs, jnp.eye(N + 1)[k], atol=1e-12)
+
+
+def reference_terms(A_y, ys, b, dts):
+    """-2 log p of every step from reference_covariance: r^T Sigma^-1 r + log det Sigma
+    + d log(2 pi).
+    """
+    from thermox.sampler import expm_vp
+
+    d = ys.shape[1]
+    r = ys[1:] - b - jax.vmap(lambda y, dt: expm_vp(A_y, y - b, dt))(ys[:-1], dts)
+
+    def term(rk, t):
+        S = reference_covariance(A_y.val, jnp.eye(d), t)
+        return rk @ jnp.linalg.solve(S, rk) + jnp.linalg.slogdet(S)[1]
+
+    return jax.vmap(term)(r, dts) + d * jnp.log(2 * jnp.pi)
+
+
+@pytest.mark.parametrize("A,D", NONNORMAL_CASES)
+def test_panels_match_reference(A, D):
+    # The interpolated value against the per-step reference, relative to the total
+    # magnitude of the terms, to the accuracy of the covariances themselves.
+    from thermox.prob import _log_prob_panels
+
+    ts = random_gaps_grid(200)
+    d = A.shape[0]
+    b = jnp.arange(1.0, d + 1.0)
+    xs = jax.random.normal(jax.random.PRNGKey(3), (len(ts), d))
+    A_y, PD = thermox.preprocess(A, D)
+    ys = jax.vmap(jnp.matmul, in_axes=(None, 0))(PD.sqrt_inv, xs)
+    value, ok = _log_prob_panels(ts, ys, A_y, PD.sqrt_inv @ b)
+    assert bool(ok)
+    terms = reference_terms(A_y, ys, PD.sqrt_inv @ b, jnp.diff(ts))
+    assert jnp.abs(value + 0.5 * jnp.sum(terms)) < 1e-10 * 0.5 * jnp.sum(jnp.abs(terms))
+
+
+def test_panels_match_reference_in_float32():
+    from thermox.prob import _log_prob_panels
+
+    A, D = A_TRI.astype(jnp.float32), jnp.eye(3, dtype=jnp.float32)
+    ts = random_gaps_grid(200).astype(jnp.float32)
+    A_y, _ = thermox.preprocess(A, D)
+    ys = jax.random.normal(jax.random.PRNGKey(3), (len(ts), 3), jnp.float32)
+    value, ok = _log_prob_panels(ts, ys, A_y, jnp.ones(3, jnp.float32))
+    assert bool(ok)
+    terms = reference_terms(
+        preprocess_drift_matrix(A_TRI), ys, jnp.ones(3), jnp.diff(ts)
+    )
+    # float32 accuracy is that of transition_expm_and_cov in float32 (twelve
+    # doublings, about 1e-4).
+    assert jnp.abs(value + 0.5 * jnp.sum(terms)) < 3e-4 * 0.5 * jnp.sum(jnp.abs(terms))
+
+
+def test_panels_grad_wrt_drift_matches_reference():
+    from thermox.prob import _log_prob_panels
+
+    A, D = A_TRI, jnp.eye(3)
+    ts = random_gaps_grid(60)
+    ys = jax.random.normal(jax.random.PRNGKey(3), (len(ts), 3))
+    b = jnp.ones(3)
+
+    def value(A):
+        return _log_prob_panels(ts, ys, preprocess_drift_matrix(A), b)[0]
+
+    g = jax.grad(value)(A)
+    g_ref = jax.grad(lambda A: reference_log_prob(ts, ys, A, b, D))(A)
+    assert relerr(g, g_ref) < 1e-8
+
+
+def test_panels_grad_wrt_ts_matches_reference():
+    # The interpolant is a polynomial in the gap, so the gradient with respect to
+    # the time stamps is finite and equal to the per-step path's.
+    from thermox.prob import _log_prob_identity_diffusion_stepwise, _log_prob_panels
+
+    ts = random_gaps_grid(60)
+    A_y = preprocess_drift_matrix(A_TRI)
+    ys = jax.random.normal(jax.random.PRNGKey(3), (len(ts), 3))
+    g = jax.grad(lambda t: _log_prob_panels(t, ys, A_y, jnp.ones(3))[0])(ts)
+    g_ref = jax.grad(
+        lambda t: _log_prob_identity_diffusion_stepwise(t, ys, A_y, jnp.ones(3))
+    )(ts)
+    assert jnp.all(jnp.isfinite(g))
+    assert relerr(g, g_ref) < 1e-8
+
+
+def test_panels_decline_oscillatory_drift():
+    from thermox.prob import _log_prob_panels
+
+    A_y = preprocess_drift_matrix(oscillatory_drift())
+    ts = random_gaps_grid(200)
+    ys = jax.random.normal(jax.random.PRNGKey(3), (len(ts), 3))
+    assert not bool(_log_prob_panels(ts, ys, A_y, jnp.zeros(3))[1])
+
+
+def test_panels_decline_zero_gap():
+    from thermox.prob import _log_prob_panels
+
+    ts = random_gaps_grid(50)
+    ts = jnp.concatenate([ts[:20], ts[19:20], ts[20:]])  # repeated time inside the grid
+    A_y = preprocess_drift_matrix(A_TRI)
+    ys = jax.random.normal(jax.random.PRNGKey(3), (len(ts), 3))
+    assert not bool(_log_prob_panels(ts, ys, A_y, jnp.zeros(3))[1])
+
+
+@pytest.mark.parametrize("dtype", [jnp.float64, jnp.float32])
+def test_panels_operator_count_is_independent_of_T(dtype):
+    # 17 eigh per used panel, inside one scan over the panels, for T = 100 and
+    # T = 200 alike.
+    from thermox.prob import _log_prob_panels
+
+    import re
+
+    A_y, _ = thermox.preprocess(A_TRI.astype(dtype), jnp.eye(3, dtype=dtype))
+    texts = []
+    for n in (100, 200):
+        ts = random_gaps_grid(n).astype(dtype)
+        ys = jax.random.normal(jax.random.PRNGKey(3), (len(ts), 3), dtype)
+        texts.append(
+            str(
+                jax.make_jaxpr(
+                    lambda ts, ys: _log_prob_panels(ts, ys, A_y, jnp.zeros(3, dtype))
+                )(ts, ys)
+            )
+        )
+    for text in texts:
+        assert (
+            text.count("= eigh[") == 1
+        )  # one call site, batched over the nodes, inside the panel scan
+        assert "[17,3,3]" in text  # the batch of N + 1 node covariances
+    assert re.findall(r"length=\d+", texts[0]) == re.findall(r"length=\d+", texts[1])
+
+
+def test_log_prob_dispatches_to_panels_on_nonuniform_grid():
+    # thermox.log_prob takes the panels on a non-uniform grid with non-normal A, and
+    # their run-time check passes there.
+    from thermox.prob import _log_prob_panels
+
+    A, D = A_SYM, D_DIAG
+    ts = jnp.array([0.0, 0.1, 0.5, 0.6, 1.4])
+    b = jnp.arange(1.0, 4.0)
+    xs = jax.random.normal(jax.random.PRNGKey(3), (len(ts), 3))
+    A_y, PD = thermox.preprocess(A, D)
+    ys = jax.vmap(jnp.matmul, in_axes=(None, 0))(PD.sqrt_inv, xs)
+    value, ok = _log_prob_panels(ts, ys, A_y, PD.sqrt_inv @ b)
+    assert bool(ok)
+    expected = value + jnp.log(jnp.linalg.det(PD.sqrt_inv)) * (len(ts) - 1)
+    assert jnp.array_equal(thermox.log_prob(ts, xs, A, b, D), expected)
+
+
+def test_log_prob_falls_back_to_per_step_path_when_check_fails():
+    # When the check fails, log_prob returns the per-step path's value, bitwise.
+    from thermox.prob import _log_prob_identity_diffusion_stepwise, _log_prob_panels
+
+    A = oscillatory_drift()
+    ts = random_gaps_grid(60)
+    xs = jax.random.normal(jax.random.PRNGKey(3), (len(ts), 3))
+    A_y = preprocess_drift_matrix(A)
+    assert not bool(_log_prob_panels(ts, xs, A_y, jnp.zeros(3))[1])
+    lp = thermox.log_prob(ts, xs, A, jnp.zeros(3), jnp.eye(3))
+    assert jnp.array_equal(
+        lp, _log_prob_identity_diffusion_stepwise(ts, xs, A_y, jnp.zeros(3))
+    )
+
+
+def test_log_prob_operator_count_is_independent_of_T():
+    # log_prob's program on a non-uniform grid carries the batch of 17 node
+    # covariances, and its eigh call sites do not multiply with T (the per-step
+    # fallback branch keeps its own T-length loop, as expected).
+    A, D = A_TRI, jnp.eye(3)
+    texts = []
+    for n in (100, 200):
+        ts = random_gaps_grid(n)
+        xs = jax.random.normal(jax.random.PRNGKey(3), (len(ts), 3))
+        texts.append(
+            str(
+                jax.make_jaxpr(
+                    lambda ts, xs: thermox.log_prob(ts, xs, A, jnp.zeros(3), D)
+                )(ts, xs)
+            )
+        )
+    assert "[17,3,3]" in texts[0]
+    assert texts[0].count("= eigh[") == texts[1].count("= eigh[")
